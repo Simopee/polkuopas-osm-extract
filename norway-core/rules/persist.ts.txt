@@ -1,0 +1,245 @@
+/**
+ * Persist path of the OSM Norway core-type loader (KAN-1678, from KAN-1516). Writes ONLY into the eight osm_no_* tables of migration 253, and only
+ * into the *_pending twins: the hot tables stay empty until the later publish step (counsel "Kill switch", runbook "Norway kill switch by staging").
+ *
+ * - Column names and types match migration 253 exactly (toDbRow). OSM-only: no official column, no matched id, no duplicate flag (O1, O2).
+ * - Dedupe (dedupeAgainstOfficial): an OSM row that lies within the family radius of an existing Norwegian row of the same catalogue type is NOT
+ *   loaded. The official coordinates are read only for that test; nothing about the pairing is stored, cached or logged (O2, O3): only aggregate
+ *   counts per type leave this module. Radius is DEDUPE_RADIUS_BY_FAMILY (classify.ts), measured in docs/research/2026-11-19-osm-no-core-production-extract.md.
+ * - Idempotent: upsert on (osm_type, osm_id), never delete-then-insert. Dry run (the default) counts and writes nothing.
+ * - Pure orchestration over the OsmNoCoreDb interface, so the whole path is unit-tested with an in-memory fake.
+ */
+import { haversineM } from '../../lib/wfs'
+import { chunk } from '../../lib/upsert'
+import type { OsmCoreType } from './classify'
+import { DEDUPE_RADIUS_BY_FAMILY } from './classify'
+import type { OsmNoCoreRow } from '../osm-no-core'
+
+export type OsmNoCoreTable = 'osm_no_viewpoint' | 'osm_no_swimming' | 'osm_no_fireplace' | 'osm_no_tentsite'
+
+export const TABLE_BY_FAMILY: Record<OsmCoreType, OsmNoCoreTable> = {
+  viewpoint: 'osm_no_viewpoint',
+  swimming: 'osm_no_swimming',
+  fireplace: 'osm_no_fireplace',
+  tent: 'osm_no_tentsite',
+}
+
+/** The physical table written: always the _pending twin. There is no way to ask for a hot table. */
+export const pendingTable = (family: OsmCoreType): string => `${TABLE_BY_FAMILY[family]}_pending`
+
+/** Columns of migration 253 that the loader writes (ingested_at takes its default; updated_at is set on every run). */
+export const DB_COLUMNS = [
+  'osm_type', 'osm_id', 'osm_version', 'osm_timestamp', 'poi_type', 'geom_method', 'name', 'name_search', 'tags', 'fylke_code', 'geom', 'extract_date', 'updated_at',
+] as const
+
+export type OsmDbRow = {
+  osm_type: 'node' | 'way'
+  osm_id: number
+  osm_version: number | null
+  osm_timestamp: string | null
+  poi_type: string
+  geom_method: 'native' | 'bbox_center'
+  name: string | null
+  name_search: string | null
+  tags: Record<string, string>
+  fylke_code: string | null
+  /** EWKT; PostgREST casts it to geography(Point, 4326). Longitude first. */
+  geom: string
+  extract_date: string
+  updated_at: string
+}
+
+export function toDbRow(r: OsmNoCoreRow, extractDate: string, nowIso: string): OsmDbRow {
+  return {
+    osm_type: r.osmType,
+    osm_id: r.osmId,
+    osm_version: r.osmVersion,
+    osm_timestamp: r.osmTimestamp,
+    poi_type: r.poiType,
+    geom_method: r.geomMethod,
+    name: r.name,
+    name_search: r.nameSearch,
+    tags: r.tags,
+    fylke_code: r.fylkeCode,
+    geom: `SRID=4326;POINT(${r.lon} ${r.lat})`,
+    extract_date: extractDate,
+    updated_at: nowIso,
+  }
+}
+
+export interface OfficialPoint {
+  lat: number
+  lon: number
+}
+/** Existing Norwegian rows by catalogue type (pois.type). */
+export type OfficialByType = Record<string, readonly OfficialPoint[]>
+
+/** Which existing types count as "the same type" for each OSM catalogue label. Fire places and grill places are separate labels and stay separate. */
+const SAME_TYPE: Record<string, string> = {
+  nakoalapaikka: 'nakoalapaikka',
+  uimapaikka: 'uimapaikka',
+  tulipaikka: 'tulipaikka',
+  grillipaikka: 'grillipaikka',
+  telttailupaikka: 'telttailupaikka',
+}
+
+export interface DedupeResult {
+  kept: OsmNoCoreRow[]
+  /** Aggregate only: rows left out, per catalogue type. No ids, no pairing. */
+  droppedByType: Record<string, number>
+}
+
+/** Uniform grid so each OSM point looks at its own and the 8 neighbouring cells only. */
+function gridIndex(points: readonly OfficialPoint[], cellDeg: number): Map<string, OfficialPoint[]> {
+  const m = new Map<string, OfficialPoint[]>()
+  for (const p of points) {
+    const k = `${Math.floor(p.lat / cellDeg)}:${Math.floor(p.lon / cellDeg)}`
+    const a = m.get(k)
+    if (a) a.push(p)
+    else m.set(k, [p])
+  }
+  return m
+}
+
+export function dedupeAgainstOfficial(rows: readonly OsmNoCoreRow[], official: OfficialByType, radiusByFamily: Record<OsmCoreType, number> = DEDUPE_RADIUS_BY_FAMILY): DedupeResult {
+  const kept: OsmNoCoreRow[] = []
+  const droppedByType: Record<string, number> = {}
+  // Cell 0.01 degree latitude is about 1.1 km, far above every radius; longitude cells are narrower at 60-71N (about 0.4 km), so scan 5 longitude cells.
+  const CELL = 0.01
+  const index = new Map<string, Map<string, OfficialPoint[]>>()
+  for (const r of rows) {
+    const t = SAME_TYPE[r.poiType]
+    const pts = t ? official[t] : undefined
+    if (!pts || pts.length === 0) {
+      kept.push(r)
+      continue
+    }
+    let g = index.get(t)
+    if (!g) {
+      g = gridIndex(pts, CELL)
+      index.set(t, g)
+    }
+    const radius = radiusByFamily[r.family]
+    const ci = Math.floor(r.lat / CELL)
+    const cj = Math.floor(r.lon / CELL)
+    let near = false
+    for (let di = -1; di <= 1 && !near; di++) {
+      for (let dj = -3; dj <= 3 && !near; dj++) {
+        for (const o of g.get(`${ci + di}:${cj + dj}`) ?? []) {
+          if (haversineM(r, o) <= radius) {
+            near = true
+            break
+          }
+        }
+      }
+    }
+    if (near) droppedByType[r.poiType] = (droppedByType[r.poiType] ?? 0) + 1
+    else kept.push(r)
+  }
+  return { kept, droppedByType }
+}
+
+export const RING_EDGES_M = [10, 25, 50, 100, 200, 500] as const
+
+/**
+ * Measurement for the dedupe threshold: per catalogue type, how many OSM rows have an existing row of the same type within each distance. Aggregate
+ * counts only (O2). Used by the dry run so the threshold is measured on the same extract and the same existing rows that the load will see.
+ */
+export function nearestRings(rows: readonly OsmNoCoreRow[], official: OfficialByType, edges: readonly number[] = RING_EDGES_M): Record<string, { osm: number; existing: number; within: Record<string, number> }> {
+  const out: Record<string, { osm: number; existing: number; within: Record<string, number> }> = {}
+  const maxEdge = Math.max(...edges)
+  const CELL = 0.01
+  const idx = new Map<string, Map<string, OfficialPoint[]>>()
+  for (const r of rows) {
+    const t = SAME_TYPE[r.poiType]
+    const pts = official[t] ?? []
+    const o = (out[r.poiType] ??= { osm: 0, existing: pts.length, within: Object.fromEntries(edges.map((e) => [String(e), 0])) })
+    o.osm += 1
+    if (pts.length === 0) continue
+    let g = idx.get(t)
+    if (!g) {
+      g = gridIndex(pts, CELL)
+      idx.set(t, g)
+    }
+    const span = Math.ceil(maxEdge / 111_000 / CELL) + 1
+    const spanLon = Math.ceil(maxEdge / (111_000 * Math.cos((r.lat * Math.PI) / 180)) / CELL) + 1
+    const ci = Math.floor(r.lat / CELL)
+    const cj = Math.floor(r.lon / CELL)
+    let best = Infinity
+    for (let di = -span; di <= span; di++) {
+      for (let dj = -spanLon; dj <= spanLon; dj++) {
+        for (const p of g.get(`${ci + di}:${cj + dj}`) ?? []) best = Math.min(best, haversineM(r, p))
+      }
+    }
+    for (const e of edges) if (best <= e) o.within[String(e)] += 1
+  }
+  return out
+}
+
+/** The database side. The Supabase adapter lives in tools/osm-no-core-load.ts; tests use a fake. */
+export interface OsmNoCoreDb {
+  /** Upsert one batch into a *_pending table. Returns null on success, else the error text (never throws for a data error). */
+  upsertBatch(table: string, rows: OsmDbRow[], onConflict: string): Promise<string | null>
+  /** Rows currently in a *_pending table (read-only count). */
+  countRows(table: string): Promise<number>
+}
+
+export interface PersistOptions {
+  dryRun: boolean
+  extractDate: string
+  now?: () => Date
+  batchSize?: number
+  maxBadBatches?: number
+  log?: (line: string) => void
+}
+
+export interface PersistResult {
+  dryRun: boolean
+  /** Rows per physical table that were (or, in a dry run, would be) written. */
+  perTable: Record<string, number>
+  written: number
+  failedRows: number
+  existingBefore: Record<string, number>
+}
+
+export const OSM_NO_CORE_ON_CONFLICT = 'osm_type,osm_id'
+export const PERSIST_BATCH_SIZE = 500
+
+export async function persistOsmNoCore(db: OsmNoCoreDb, rows: readonly OsmNoCoreRow[], opts: PersistOptions): Promise<PersistResult> {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(opts.extractDate)) throw new Error(`osm-no-core persist: extractDate must be YYYY-MM-DD, got "${opts.extractDate}"`)
+  const log = opts.log ?? (() => undefined)
+  const nowIso = (opts.now?.() ?? new Date()).toISOString()
+  const size = opts.batchSize ?? PERSIST_BATCH_SIZE
+  const maxBad = opts.maxBadBatches ?? 3
+  const byTable = new Map<string, OsmDbRow[]>()
+  for (const r of rows) {
+    const t = pendingTable(r.family)
+    const a = byTable.get(t)
+    const row = toDbRow(r, opts.extractDate, nowIso)
+    if (a) a.push(row)
+    else byTable.set(t, [row])
+  }
+  const result: PersistResult = { dryRun: opts.dryRun, perTable: {}, written: 0, failedRows: 0, existingBefore: {} }
+  let badBatches = 0
+  for (const [table, trs] of [...byTable].sort(([a], [b]) => a.localeCompare(b))) {
+    result.perTable[table] = trs.length
+    result.existingBefore[table] = await db.countRows(table)
+    if (opts.dryRun) {
+      log(`dry run: ${table} would upsert ${trs.length} row(s) (${result.existingBefore[table]} already there)`)
+      continue
+    }
+    for (const batch of chunk(trs, size)) {
+      const err = await db.upsertBatch(table, batch, OSM_NO_CORE_ON_CONFLICT)
+      if (err === null) {
+        result.written += batch.length
+        continue
+      }
+      result.failedRows += batch.length
+      badBatches += 1
+      log(`${table}: batch of ${batch.length} rejected: ${err}`)
+      if (badBatches > maxBad) throw new Error(`osm-no-core persist: more than ${maxBad} batches rejected; aborted after ${result.written} rows written (re-run is safe, the upsert is idempotent)`)
+    }
+    log(`${table}: upserted ${trs.length} row(s)`)
+  }
+  return result
+}

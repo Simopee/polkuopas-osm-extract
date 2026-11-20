@@ -1,0 +1,69 @@
+/**
+ * Type and privacy decisions of the OSM Norway core-type dataset (KAN-1516). Pure.
+ *
+ * Four types only: viewpoint, swimming place, fire place, tent site (docs/research/2026-11-18-norway-osm-core-gap-yield.md).
+ * Finnish catalogue labels are reused (nakoalapaikka, uimapaikka, tulipaikka, grillipaikka, telttailupaikka); the OSM rows still live in their own
+ * tables (counsel O1) and carry no value from an official source (O2).
+ */
+import type { CatalogueType } from '../../../../app/src/lib/typeCatalogue'
+
+export type OsmCoreType = 'viewpoint' | 'swimming' | 'fireplace' | 'tent'
+
+/** Per OSM class tag: the table family and the catalogue type. */
+export const CLASS_MAP: Record<string, { family: OsmCoreType; poiType: CatalogueType }> = {
+  'tourism=viewpoint': { family: 'viewpoint', poiType: 'nakoalapaikka' },
+  'leisure=bathing_place': { family: 'swimming', poiType: 'uimapaikka' },
+  'leisure=swimming_area': { family: 'swimming', poiType: 'uimapaikka' },
+  'leisure=firepit': { family: 'fireplace', poiType: 'tulipaikka' },
+  // Grillplass maps to grillipaikka, never tulipaikka (data/CLAUDE.md).
+  'amenity=bbq': { family: 'fireplace', poiType: 'grillipaikka' },
+  'tourism=camp_site': { family: 'tent', poiType: 'telttailupaikka' },
+  'tourism=camp_pitch': { family: 'tent', poiType: 'telttailupaikka' },
+}
+
+/** Counsel O7 whitelist; the extractor already applies it and the loader enforces it again. */
+export const TAG_WHITELIST = ['name', 'access', 'fee', 'tents', 'caravans', 'backcountry', 'capacity'] as const
+
+/** Display-time dedupe radius per family, measured 2026-11-18 (the research doc, section "Dedupe threshold"). */
+export const DEDUPE_RADIUS_BY_FAMILY: Record<OsmCoreType, number> = { viewpoint: 50, swimming: 50, fireplace: 50, tent: 100 }
+
+const RESTRICTED_ACCESS = new Set(['private', 'no', 'customers', 'residents', 'permit'])
+
+export type Decision = { kind: 'keep'; family: OsmCoreType; poiType: CatalogueType } | { kind: 'skip'; reason: string }
+
+/** Strict tent-site rule: a primitive tent place, not a commercial campsite (which is `leirintaalue`) and not a single pitch inside one. */
+export function decideTent(tags: Record<string, string>): boolean {
+  if (tags.tents === 'no') return false
+  if (tags.backcountry === 'yes') return true
+  return tags.fee === 'no' && tags.caravans !== 'yes'
+}
+
+export function decide(classTag: string, tags: Record<string, string>): Decision {
+  const c = CLASS_MAP[classTag]
+  if (!c) return { kind: 'skip', reason: 'class-not-in-scope' }
+  if (tags.access && RESTRICTED_ACCESS.has(tags.access)) return { kind: 'skip', reason: 'access-restricted' }
+  if (c.family === 'tent') {
+    if (tags.tents === 'no') return { kind: 'skip', reason: 'tents-not-allowed' }
+    if (!decideTent(tags)) return { kind: 'skip', reason: 'tent-commercial-or-pitch' }
+  }
+  return { kind: 'keep', family: c.family, poiType: c.poiType }
+}
+
+/** Name screen for personal data (counsel O7, feedback_no_private_person_data): phone-like digit runs, e-mail, c/o. Returns the reason or null. */
+export function nameScreenHit(name: string | null | undefined): string | null {
+  if (!name) return null
+  if (/@/.test(name)) return 'email'
+  if ((name.match(/\d/g) ?? []).length >= 7 || /\+\d{2}/.test(name)) return 'phone'
+  if (/\bc\/o\b/i.test(name)) return 'c/o'
+  return null
+}
+
+/** Keep only whitelisted tags, as strings. Never a copy of anything else. */
+export function whitelistTags(tags: Record<string, unknown> | null | undefined): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const k of TAG_WHITELIST) {
+    const v = tags?.[k]
+    if (typeof v === 'string' && v.length > 0) out[k] = v
+  }
+  return out
+}

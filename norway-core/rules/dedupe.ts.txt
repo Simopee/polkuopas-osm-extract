@@ -1,0 +1,28 @@
+/**
+ * Display-time duplicate test for OSM Norway rows (KAN-1516; counsel O2 and O3). Pure.
+ *
+ * It reads official coordinates only to decide whether an OSM row is hidden. Nothing here is stored: no matched id, no flag, no copied name
+ * (O2). The loader writes every kept OSM row; the read path (a later backend migration, not part of this step) and the dry-run report call this.
+ */
+import { haversineM } from '../../lib/wfs'
+import { DEDUPE_RADIUS_BY_FAMILY, type OsmCoreType } from './classify'
+
+export interface LatLon {
+  lat: number
+  lon: number
+}
+
+/** Nearest official point of the same type within the family radius, brute force. For a bbox read (a few hundred points) this is enough. */
+export function isNearOfficial(point: LatLon, family: OsmCoreType, official: readonly LatLon[], radiusM = DEDUPE_RADIUS_BY_FAMILY[family]): boolean {
+  // Cheap degree prefilter before the exact distance: 1 degree of latitude is about 111 km.
+  const dLat = radiusM / 111_000
+  for (const o of official) {
+    if (Math.abs(o.lat - point.lat) > dLat) continue
+    if (haversineM(point, o) <= radiusM) return true
+  }
+  return false
+}
+
+export function hiddenAsDuplicates<T extends LatLon>(rows: readonly T[], family: OsmCoreType, official: readonly LatLon[], radiusM?: number): T[] {
+  return rows.filter((r) => isNearOfficial(r, family, official, radiusM))
+}

@@ -123,3 +123,14 @@ Notes on how the selection behaves:
 
 Wherever the overlay is shown, the map displays "Map data (c) OpenStreetMap
 contributors" in its attribution control.
+
+## Norway core types (2026-11)
+
+This repository also publishes a second, separate Derivative Database: OpenStreetMap
+objects in Norway of four outdoor place types (viewpoint, swimming place, fire
+place, tent site). The database file is `polkuopas-osm-no-core.geojson` at the
+repository root. Its method (extractor, tag whitelist, classification and
+duplicate rules, rebuild steps) and the ODbL 1.0 text are in `norway-core/`
+(`norway-core/README.md`, `norway-core/rules/`, `norway-core/LICENSE`). The
+Finnish method described above is not changed by this addition. See
+`LICENCE-NOTICE.md` for scope and publication status.
