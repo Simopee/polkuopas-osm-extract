@@ -38,6 +38,19 @@ export function decideTent(tags: Record<string, string>): boolean {
   return tags.fee === 'no' && tags.caravans !== 'yes'
 }
 
+/**
+ * KAN-1681 (counsel O8 2.4 / T3): Svalbard (fylke 21) and Jan Mayen (fylke 22) tent points are never kept. A rule, not a property of today's extract
+ * (which holds none): matches the fylke code OR the island boxes (same boxes as app/src/lib/norway/geometry.ts isInSvalbard and
+ * app/src/lib/osmNoCore/core.ts isInJanMayen). The publish SQL (publish.ts, TENT_EXCLUSION_SQL) repeats the same test as a second line of defence.
+ */
+export const SVALBARD_BOX = { south: 72, north: 82, west: 9, east: 34 } as const
+export const JAN_MAYEN_BOX = { south: 70.8, north: 71.2, west: -9.3, east: -7.9 } as const
+export function isSvalbardOrJanMayen(lat: number, lon: number, fylkeCode: string | null): boolean {
+  if (fylkeCode === '21' || fylkeCode === '22') return true
+  const inBox = (b: { south: number; north: number; west: number; east: number }): boolean => lat >= b.south && lat <= b.north && lon >= b.west && lon <= b.east
+  return inBox(SVALBARD_BOX) || inBox(JAN_MAYEN_BOX)
+}
+
 export function decide(classTag: string, tags: Record<string, string>): Decision {
   const c = CLASS_MAP[classTag]
   if (!c) return { kind: 'skip', reason: 'class-not-in-scope' }
