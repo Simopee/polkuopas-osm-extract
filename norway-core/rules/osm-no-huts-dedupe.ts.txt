@@ -1,0 +1,53 @@
+/**
+ * Display-time duplicate test of OSM huts and shelters against official hut points (KAN-1684; counsel O2 and O3). Pure.
+ *
+ * Official coordinates are read only to decide whether an OSM row is a gap. Nothing is stored: no matched id, no flag, no copied name. Only aggregate
+ * counts leave this module. Reference set: every official hut-like point, whatever its type (turisthytte, laavu, autiotupa), because OSM
+ * `wilderness_hut` / `lean_to` and the official labels disagree often (a gapahuk is a laavu in one source and a hut in another).
+ */
+import { haversineM } from '../../lib/wfs'
+import { HUT_DEDUPE_RADIUS_M } from './classify'
+
+export interface LatLon {
+  lat: number
+  lon: number
+}
+
+const CELL = 0.01
+
+function key(lat: number, lon: number): string {
+  return `${Math.floor(lat / CELL)}:${Math.floor(lon / CELL)}`
+}
+
+export function indexPoints(points: readonly LatLon[]): Map<string, LatLon[]> {
+  const m = new Map<string, LatLon[]>()
+  for (const p of points) {
+    const k = key(p.lat, p.lon)
+    const a = m.get(k)
+    if (a) a.push(p)
+    else m.set(k, [p])
+  }
+  return m
+}
+
+/** Distance in metres to the nearest indexed point, searched out to maxM; Infinity when none. */
+export function nearestDistanceM(p: LatLon, index: Map<string, LatLon[]>, maxM: number): number {
+  const spanLat = Math.ceil(maxM / 111_000 / CELL) + 1
+  const spanLon = Math.ceil(maxM / (111_000 * Math.cos((p.lat * Math.PI) / 180)) / CELL) + 1
+  const ci = Math.floor(p.lat / CELL)
+  const cj = Math.floor(p.lon / CELL)
+  let best = Infinity
+  for (let di = -spanLat; di <= spanLat; di++) {
+    for (let dj = -spanLon; dj <= spanLon; dj++) {
+      for (const o of index.get(`${ci + di}:${cj + dj}`) ?? []) best = Math.min(best, haversineM(p, o))
+    }
+  }
+  return best
+}
+
+export function dedupeHuts<T extends LatLon>(rows: readonly T[], official: readonly LatLon[], radiusM = HUT_DEDUPE_RADIUS_M): { kept: T[]; dropped: number } {
+  const idx = indexPoints(official)
+  const kept: T[] = []
+  for (const r of rows) if (nearestDistanceM(r, idx, radiusM) > radiusM) kept.push(r)
+  return { kept, dropped: rows.length - kept.length }
+}

@@ -1,0 +1,75 @@
+/**
+ * Type and privacy decisions of the OSM Norway huts and shelters dataset (KAN-1684, from KAN-1516 / SD-076). Pure.
+ *
+ * Scope: tourism=alpine_hut, tourism=wilderness_hut (family `hut`, catalogue type turisthytte, the same label as N50 and RuteInfoPunkt huts) and
+ * amenity=shelter with a hut-like shelter_type (family `shelter`, catalogue type laavu). Bus stop shelters, picnic shelters, gazebos, pavilions,
+ * wildlife hides, rock overhangs and untyped shelters are NOT huts and are held back with a counted reason.
+ * OSM rows stay OSM-only (counsel O1, O2, O6): no official value in, none copied out. No safety content: no open/locked/capacity claim is kept.
+ */
+import type { CatalogueType } from '../../../../app/src/lib/typeCatalogue'
+import { isSvalbardOrJanMayen } from '../osm-no-core/classify'
+
+export type OsmHutFamily = 'hut' | 'shelter'
+
+export const HUT_CLASS_MAP: Record<string, { family: OsmHutFamily; poiType: CatalogueType }> = {
+  'tourism=alpine_hut': { family: 'hut', poiType: 'turisthytte' },
+  'tourism=wilderness_hut': { family: 'hut', poiType: 'turisthytte' },
+  'amenity=shelter': { family: 'shelter', poiType: 'laavu' },
+}
+
+/**
+ * shelter_type values that are hiking shelters. weather_shelter (founder 2026-11-21: IN) is a roof only; the extractor has already dropped the ones that are
+ * also bus stops or buildings, and the stored row keeps shelter_type so the weather class can be held back on its own (counsel 2026-11-21 section 4).
+ */
+export const SHELTER_TYPES_KEPT = ['lean_to', 'basic_hut', 'lavvu'] as const
+export const SHELTER_TYPES_OPTIONAL = ['weather_shelter'] as const
+export const SHELTER_TYPES_STORED = [...SHELTER_TYPES_KEPT, ...SHELTER_TYPES_OPTIONAL] as const
+
+/**
+ * Counsel O7 whitelist; the extractor applies it and the loader enforces it again. `reservation` is dropped (counsel 2026-11-21 section 7): no rule uses it
+ * and a published value invites the booking reading the card must not give. access, shelter_type and building are classification inputs, never rendered.
+ */
+export const HUT_TAG_WHITELIST = ['name', 'access', 'shelter_type', 'building'] as const
+
+/** Display-time dedupe radius against official hut points of the same kind (measured, docs/research/2026-11-20-kan1684-osm-gap-types.md). */
+export const HUT_DEDUPE_RADIUS_M = 100
+
+const RESTRICTED_ACCESS = new Set(['private', 'no', 'customers', 'residents', 'permit'])
+/** Commercial lodging mapped as alpine_hut: not a trail hut. */
+const COMMERCIAL_BUILDING = new Set(['hotel', 'kiosk', 'commercial', 'retail', 'apartments'])
+
+export type HutDecision = { kind: 'keep'; family: OsmHutFamily; poiType: CatalogueType } | { kind: 'skip'; reason: string }
+
+/**
+ * Founder 2026-11-21: Svalbard and Jan Mayen are OUT (counsel 2026-11-21 section 6). Two independent tests, the same as the extractor's: the fylke code
+ * (21, 22) and a coordinate guard (74 N or higher; above 70 N and west of 0; plus the tested boxes of osm-no-core/classify.ts). Mainland Norway lies east of 4 E
+ * and south of 71.2 N, so none of these can catch a mainland row.
+ */
+export function isSvalbardOrJanMayenHut(lat: number, lon: number, fylkeCode: string | null): boolean {
+  return isSvalbardOrJanMayen(lat, lon, fylkeCode) || lat >= 74 || (lat > 70 && lon < 0)
+}
+
+export function decideHut(classTag: string, tags: Record<string, string>, opts: { includeWeatherShelter?: boolean } = {}): HutDecision {
+  const includeWeather = opts.includeWeatherShelter ?? true
+  const c = HUT_CLASS_MAP[classTag]
+  if (!c) return { kind: 'skip', reason: 'class-not-in-scope' }
+  if (tags.access && RESTRICTED_ACCESS.has(tags.access)) return { kind: 'skip', reason: 'access-restricted' }
+  if (c.family === 'hut') {
+    if (tags.building && COMMERCIAL_BUILDING.has(tags.building)) return { kind: 'skip', reason: 'commercial-building' }
+    return { kind: 'keep', family: c.family, poiType: c.poiType }
+  }
+  const st = tags.shelter_type
+  if (!st) return { kind: 'skip', reason: 'shelter-untyped' }
+  if ((SHELTER_TYPES_KEPT as readonly string[]).includes(st)) return { kind: 'keep', family: c.family, poiType: c.poiType }
+  if (includeWeather && (SHELTER_TYPES_OPTIONAL as readonly string[]).includes(st)) return { kind: 'keep', family: c.family, poiType: c.poiType }
+  return { kind: 'skip', reason: `shelter-type-${st === 'public_transport' ? 'public-transport' : (SHELTER_TYPES_OPTIONAL as readonly string[]).includes(st) ? 'weather-optional' : 'other'}` }
+}
+
+export function whitelistHutTags(tags: Record<string, unknown> | null | undefined): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const k of HUT_TAG_WHITELIST) {
+    const v = tags?.[k]
+    if (typeof v === 'string' && v.length > 0) out[k] = v
+  }
+  return out
+}

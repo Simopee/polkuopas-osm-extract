@@ -1,0 +1,119 @@
+/**
+ * OSM Norway huts and shelters, working id `osm-no-huts` (KAN-1684, from KAN-1516 and SD-076). Pure transform: turns an extract into rows and counts them;
+ * it cannot write to a database. The persist path is osm-no-huts/persist.ts (only the osm_no_hut_pending and osm_no_shelter_pending tables of migration 264),
+ * the publish path is osm-no-huts/publish.ts. There is no run.ts wiring and no mapRows/live mapping: these rows never go to `pois` (counsel O1).
+ *
+ * Input: the ODbL extract built by data/nordic-sync/tools/osm-no-huts-extract.py (published in the public extract repo before any row is visible, O5).
+ * Rules: see osm-no-huts/classify.ts. Names that look like a phone number, e-mail or c/o are withheld (O7). Dedupe is a display-time distance test
+ * against official hut points (osm-no-huts/dedupe.ts); no pairing or flag is stored (O2, O3).
+ */
+import type { TransformResult } from '../../types'
+import { foldName, type Band } from '../../lib/wfs'
+import { nameScreenHit } from '../osm-no-core/classify'
+import { HUT_CLASS_MAP, decideHut, isSvalbardOrJanMayenHut, whitelistHutTags, type OsmHutFamily } from './classify'
+
+/**
+ * Kept-row band of the loader (rows after the access, commercial-building, shelter-type and Svalbard rules), measured on the committed 2026-11-19 extract
+ * (see the extract README) plus or minus about 15 percent. A count outside it means the extract is wrong: check it before widening the band.
+ */
+export const OSM_NO_HUTS_BAND: Band = { min: 2500, max: 3390 }
+
+export interface OsmHutFeature {
+  type: 'Feature'
+  geometry: { type: 'Point'; coordinates: [number, number] }
+  properties: {
+    osm_type: 'node' | 'way'
+    osm_id: number
+    osm_version: number | null
+    osm_timestamp: string | null
+    class_tag: string
+    geom_method: 'native' | 'bbox_center'
+    fylke_code: string | null
+    tags: Record<string, unknown>
+  }
+}
+
+export interface OsmNoHutsRaw {
+  features: OsmHutFeature[]
+}
+
+export interface OsmNoHutsRow {
+  source: 'osm-no-huts'
+  family: OsmHutFamily
+  poiType: string
+  osmType: 'node' | 'way'
+  osmId: number
+  osmVersion: number | null
+  osmTimestamp: string | null
+  geomMethod: 'native' | 'bbox_center'
+  name: string | null
+  nameSearch: string | null
+  lat: number
+  lon: number
+  fylkeCode: string | null
+  /** shelter_type of a shelter row (lean_to, basic_hut, lavvu, weather_shelter); null for a hut. Stored in its own column, never rendered. */
+  shelterType: string | null
+  nameWithheld: string | null
+}
+
+export function transformOsmNoHuts(raw: OsmNoHutsRaw, opts: { includeWeatherShelter?: boolean } = {}): TransformResult<OsmNoHutsRow> {
+  const rows: OsmNoHutsRow[] = []
+  const skipped = new Map<string, number>()
+  const skip = (reason: string): void => void skipped.set(reason, (skipped.get(reason) ?? 0) + 1)
+  const seen = new Set<string>()
+  for (const f of raw.features) {
+    const p = f.properties
+    const key = `${p.osm_type}/${p.osm_id}`
+    if (seen.has(key)) {
+      skip('duplicate-osm-object')
+      continue
+    }
+    seen.add(key)
+    if (!HUT_CLASS_MAP[p.class_tag]) throw new Error(`osm-no-huts: class ${p.class_tag} is not in scope (${key}); the extract must hold the three hut classes only`)
+    const [lon, lat] = f.geometry.coordinates
+    if (isSvalbardOrJanMayenHut(lat, lon, p.fylke_code)) {
+      skip('excluded-svalbard-jan-mayen')
+      continue
+    }
+    if (!(lat > 57 && lat < 82 && lon > 4 && lon < 34)) {
+      skip('outside-expected-box')
+      continue
+    }
+    const tags = whitelistHutTags(p.tags)
+    const d = decideHut(p.class_tag, tags, opts)
+    if (d.kind === 'skip') {
+      skip(d.reason)
+      continue
+    }
+    const hit = nameScreenHit(tags.name) ?? (tags.name && /https?:|www\./i.test(tags.name) ? 'url' : null)
+    const name = hit ? null : (tags.name ?? null)
+    rows.push({
+      source: 'osm-no-huts',
+      family: d.family,
+      poiType: d.poiType,
+      osmType: p.osm_type,
+      osmId: p.osm_id,
+      osmVersion: p.osm_version,
+      osmTimestamp: p.osm_timestamp,
+      geomMethod: p.geom_method,
+      name,
+      nameSearch: name ? foldName(name) : null,
+      lat,
+      lon,
+      fylkeCode: p.fylke_code,
+      shelterType: d.family === 'shelter' ? (tags.shelter_type ?? null) : null,
+      nameWithheld: hit,
+    })
+  }
+  return { rows, skipped: [...skipped].map(([reason, count]) => ({ reason, count })) }
+}
+
+export function countHutsByFylke(rows: readonly OsmNoHutsRow[]): Record<string, Record<string, number>> {
+  const out: Record<string, Record<string, number>> = {}
+  for (const r of rows) {
+    const f = r.fylkeCode ?? 'none'
+    out[r.family] ??= {}
+    out[r.family][f] = (out[r.family][f] ?? 0) + 1
+  }
+  return out
+}

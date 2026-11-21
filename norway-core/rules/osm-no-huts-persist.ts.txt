@@ -1,0 +1,136 @@
+/**
+ * Persist path of the OSM Norway huts and shelters loader (KAN-1684, from KAN-1516). Writes ONLY into osm_no_hut_pending and osm_no_shelter_pending of
+ * migration 264: the hot tables stay empty until the later publish step (counsel "Kill switch", runbook "Norway kill switch by staging").
+ *
+ * - Column names and types match migration 264 exactly (toDbRow). OSM-only: no official column, no matched id, no duplicate flag (O1, O2).
+ * - NO dedupe here (founder 2026-11-21: 100 m radius at DISPLAY time, counsel section 5). The load stores every kept OSM row; the read RPC
+ *   get_osm_no_huts_in_bbox hides a row within 100 m of a visible official hut or shelter point and stores no pairing. Official coordinates are never read
+ *   by this module (the dry run in tools/osm-no-huts-dryrun.ts reads an exported point file for the yield figures only).
+ * - Idempotent: upsert on (osm_type, osm_id), never delete-then-insert. Dry run (the default) counts and writes nothing.
+ * - Pure orchestration over the OsmNoHutsDb interface, so the whole path is unit-tested with an in-memory fake.
+ */
+import { chunk } from '../../lib/upsert'
+import type { OsmHutFamily } from './classify'
+import type { OsmNoHutsRow } from './transform'
+
+export const TABLE_BY_FAMILY: Record<OsmHutFamily, 'osm_no_hut' | 'osm_no_shelter'> = {
+  hut: 'osm_no_hut',
+  shelter: 'osm_no_shelter',
+}
+
+/** The physical table written: always the _pending twin. There is no way to ask for a hot table. */
+export const pendingTable = (family: OsmHutFamily): string => `${TABLE_BY_FAMILY[family]}_pending`
+
+/** Columns of migration 264 that the loader writes (ingested_at takes its default; updated_at is set on every run). shelter_type exists on the shelter tables only. */
+export const DB_COLUMNS_HUT = [
+  'osm_type', 'osm_id', 'osm_version', 'osm_timestamp', 'poi_type', 'geom_method', 'name', 'name_search', 'fylke_code', 'geom', 'extract_date', 'updated_at',
+] as const
+export const DB_COLUMNS_SHELTER = [...DB_COLUMNS_HUT, 'shelter_type'] as const
+
+export type OsmHutDbRow = {
+  osm_type: 'node' | 'way'
+  osm_id: number
+  osm_version: number | null
+  osm_timestamp: string | null
+  poi_type: string
+  geom_method: 'native' | 'bbox_center'
+  name: string | null
+  name_search: string | null
+  fylke_code: string | null
+  /** EWKT; PostgREST casts it to geography(Point, 4326). Longitude first. */
+  geom: string
+  extract_date: string
+  updated_at: string
+  /** Shelter rows only. */
+  shelter_type?: string
+}
+
+export function toDbRow(r: OsmNoHutsRow, extractDate: string, nowIso: string): OsmHutDbRow {
+  const base: OsmHutDbRow = {
+    osm_type: r.osmType,
+    osm_id: r.osmId,
+    osm_version: r.osmVersion,
+    osm_timestamp: r.osmTimestamp,
+    poi_type: r.poiType,
+    geom_method: r.geomMethod,
+    name: r.name,
+    name_search: r.nameSearch,
+    fylke_code: r.fylkeCode,
+    geom: `SRID=4326;POINT(${r.lon} ${r.lat})`,
+    extract_date: extractDate,
+    updated_at: nowIso,
+  }
+  if (r.family === 'shelter') {
+    if (!r.shelterType) throw new Error(`osm-no-huts persist: shelter ${r.osmType}/${r.osmId} has no shelter_type`)
+    base.shelter_type = r.shelterType
+  }
+  return base
+}
+
+/** The database side. The Supabase adapter lives in lib/osmNoHutsDb.ts; tests use a fake. */
+export interface OsmNoHutsDb {
+  /** Upsert one batch into a *_pending table. Returns null on success, else the error text (never throws for a data error). */
+  upsertBatch(table: string, rows: OsmHutDbRow[], onConflict: string): Promise<string | null>
+  /** Rows currently in a *_pending table (read-only count). */
+  countRows(table: string): Promise<number>
+}
+
+export interface PersistOptions {
+  dryRun: boolean
+  extractDate: string
+  now?: () => Date
+  batchSize?: number
+  maxBadBatches?: number
+  log?: (line: string) => void
+}
+
+export interface PersistResult {
+  dryRun: boolean
+  /** Rows per physical table that were (or, in a dry run, would be) written. */
+  perTable: Record<string, number>
+  written: number
+  failedRows: number
+  existingBefore: Record<string, number>
+}
+
+export const OSM_NO_HUTS_ON_CONFLICT = 'osm_type,osm_id'
+export const PERSIST_BATCH_SIZE = 500
+
+export async function persistOsmNoHuts(db: OsmNoHutsDb, rows: readonly OsmNoHutsRow[], opts: PersistOptions): Promise<PersistResult> {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(opts.extractDate)) throw new Error(`osm-no-huts persist: extractDate must be YYYY-MM-DD, got "${opts.extractDate}"`)
+  const log = opts.log ?? (() => undefined)
+  const nowIso = (opts.now?.() ?? new Date()).toISOString()
+  const size = opts.batchSize ?? PERSIST_BATCH_SIZE
+  const maxBad = opts.maxBadBatches ?? 3
+  const byTable = new Map<string, OsmHutDbRow[]>()
+  for (const r of rows) {
+    const t = pendingTable(r.family)
+    const row = toDbRow(r, opts.extractDate, nowIso)
+    const a = byTable.get(t)
+    if (a) a.push(row)
+    else byTable.set(t, [row])
+  }
+  const result: PersistResult = { dryRun: opts.dryRun, perTable: {}, written: 0, failedRows: 0, existingBefore: {} }
+  let badBatches = 0
+  for (const [table, trs] of [...byTable].sort(([a], [b]) => a.localeCompare(b))) {
+    result.perTable[table] = trs.length
+    result.existingBefore[table] = await db.countRows(table)
+    if (opts.dryRun) {
+      log(`dry run: ${table} would upsert ${trs.length} row(s) (${result.existingBefore[table]} already there)`)
+      continue
+    }
+    for (const batch of chunk(trs, size)) {
+      const err = await db.upsertBatch(table, batch, OSM_NO_HUTS_ON_CONFLICT)
+      if (err === null) {
+        result.written += batch.length
+        continue
+      }
+      result.failedRows += batch.length
+      badBatches += 1
+      log(`${table}: batch of ${batch.length} rejected: ${err}`)
+      if (badBatches > maxBad) throw new Error(`osm-no-huts persist: more than ${maxBad} batches rejected; aborted after ${result.written} rows written (re-run is safe, the upsert is idempotent)`)
+    }
+    log(`${table}: upserted ${trs.length} row(s)`)
+  }
+  return result
+}
